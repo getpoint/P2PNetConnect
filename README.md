@@ -23,9 +23,9 @@ P2P(peer to peer)内网穿透, 用于Java客户端(例如Android手机)和未获
 
 - 下载P2PServer, 将该文件夹放置在能够运行Python3.8的公网主机上
 
-- 修改P2PServer/config.json, 需要占用两个空闲端口
+- 修改P2PServer/config.json, 需要占用两个空闲端口, 注意删除"//"以及该行之后的注释
 
-  ```json
+  ```text
   {
     "local_ip": "47.110.62.233", //公网服务器的公网IP
     "http_port": 50300, // http使用的空闲端口
@@ -45,9 +45,9 @@ P2P(peer to peer)内网穿透, 用于Java客户端(例如Android手机)和未获
 
 - 按照个人需求启动服务端口监听请求, 此次在网络结构中的局域网服务器B监听50302端口
 
-- 修改P2PServer/config.json:
+- 修改P2PServer/config.json, 注意删除"//"以及该行之后的注释:
 
-```json
+```text
   {
     "p2p_server_address": "http://47.110.62.233:50300", //填写1中对应的地址
     "p2p_client_id": "streamserver", //p2p客户端id, P2P公网服务器进行记录, 用于局域网客户端A进行填写
@@ -100,7 +100,7 @@ P2P(peer to peer)内网穿透, 用于Java客户端(例如Android手机)和未获
   P2pClient p2pClient = new P2pClient();
   // 获取本地和对端需要使用的地址
   LocalPeerAddress localPeerAddress = p2pClient.getP2PLocalPeerAddress("47.110.62.233", 50300, "getpoint", "streamserver");
-if (null == localPeerAddress) {
+  if (null == localPeerAddress) {
       System.out.println("getP2PLocalPeerAddress failed");
       return;
   }
@@ -152,4 +152,4 @@ if (null == localPeerAddress) {
 
 ## 技术支持
 
-邮件：[getpoints@qq.com](mailto:getpoints@qq.com)
+邮件：[getpoints@qq.com](mailto:getpoints@qq.com)(欢迎提建议或技术讨论)
