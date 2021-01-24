@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">P2pClientForAndroidClient</string>
+    <string name="p2pserver_input_notice">please input p2p server address</string>
+    <string name="p2ptest_button">P2PTest</string>
+    <string name="p2p_local_id_notice">please input local id</string>
+    <string name="p2p_peer_id_notice">please input peer id</string>
+    <string name="p2p_result">p2p result will show here</string>
+</resources>
