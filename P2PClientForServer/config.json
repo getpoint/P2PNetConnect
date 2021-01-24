@@ -1,0 +1,5 @@
+{
+  "p2p_server_address": "http://47.110.62.233:50300",
+  "p2p_client_id": "streamserver",
+  "local_server_port": 50302
+}
