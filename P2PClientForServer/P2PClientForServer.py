@@ -110,7 +110,8 @@ class P2PClientManagement(object):
                     message_dict["result"] = "failed"
                 client.close()
                 await websocket_client.send(json.dumps(message_dict))
-                print("connect cmd handle end")
+                print("connect cmd handle end, %s:%d connect %s:%d"
+                      % (self.local_ip, self.local_listen_port, message_dict['ip'], message_dict['port']))
                 self.last_connect_time = time.time()
 
                 self.connect_lock.release()

@@ -1,11 +1,16 @@
 package com.getpoint.p2pclient;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
 import org.jetbrains.annotations.NotNull;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.net.InetAddress;
@@ -19,12 +24,23 @@ import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.List;
 
-class P2pClientWebsocket extends WebSocketClient{
-    private final Object lock;
-    public HostTuple last_peer_host;
-    public P2pClientWebsocket(URI serverUri, Object lock) {
+
+class NetWorkStateReceiver extends BroadcastReceiver {
+    boolean isNetworkChanged = true;
+
+    @Override
+    public void onReceive(Context context, Intent intent) {
+        System.out.println("Network state changes");
+        isNetworkChanged = true;
+    }
+}
+
+class P2pClientWebsocket extends WebSocketClient {
+    public final Object p2pWebsocketNotifySyncObject = new Object();
+    public HostTuple lastPeerHost;
+
+    public P2pClientWebsocket(URI serverUri) {
         super(serverUri);
-        this.lock = lock;
     }
 
     @Override
@@ -45,9 +61,9 @@ class P2pClientWebsocket extends WebSocketClient{
             String cmd = jsonObject.getString("cmd");
             if (cmd.equals("notify_connect")) {
                 JSONObject peer_info = (JSONObject) jsonObject.get("peer_client_info");
-                last_peer_host = new HostTuple(peer_info.getString("ip_outside"), peer_info.getInt("port_outside"));
-                synchronized (lock) {
-                    lock.notify();
+                lastPeerHost = new HostTuple(peer_info.getString("ip_outside"), peer_info.getInt("port_outside"));
+                synchronized (p2pWebsocketNotifySyncObject) {
+                    p2pWebsocketNotifySyncObject.notify();
                 }
             } else if (cmd.equals("register")) {
                 String result = jsonObject.getString("result");
@@ -72,22 +88,75 @@ class P2pClientWebsocket extends WebSocketClient{
         System.err.println("an error occurred:" + ex);
     }
 
+    /**
+     * 向websocket服务器进行注册
+     * @param localClientId   需要注册到p2p服务器上的本地client_id, 告知对端连接本地client_id
+     */
+    public void register(String localClientId) throws InterruptedException {
+        connectBlocking();
+        send("{\"cmd\": \"register\", \"client_id\": \""+ localClientId +"\", \"type\": \"client\"}");
+    }
+
+    /**
+     * 通知打洞, 打洞成功后返回对端的公网地址
+     * @param localClientId   需要注册到p2p服务器上的本地client_id, 告知对端连接本地client_id
+     * @param peerClientId   需要通过p2p连接的对端的client_id
+     * @return  success return p2pPeerHost or fail return null
+     */
+    public HostTuple getPeerHost(String localClientId, String peerClientId) {
+        HostTuple p2pPeerHost;
+
+        JSONObject jsonObject = new JSONObject();
+        try {
+            jsonObject.put("cmd", "notify_connect");
+            jsonObject.put("local_client_id", localClientId);
+            jsonObject.put("peer_client_id", peerClientId);
+        } catch (JSONException e) {
+            e.printStackTrace();
+            System.out.println("create jsonObject failed");
+            return null;
+        }
+        send(jsonObject.toString());
+
+        // 等待响应, 当p2pClientWebsocket接收到响应时会进行notify()
+        synchronized (p2pWebsocketNotifySyncObject) {
+            try {
+                p2pWebsocketNotifySyncObject.wait(5000);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                return null;
+            }
+        }
+        if (lastPeerHost == null) {
+            System.out.println("can not get notify_connect response");
+            return null;
+        }
+
+        p2pPeerHost = lastPeerHost;
+        // 清空上次获取得到的host
+        lastPeerHost = null;
+
+        return p2pPeerHost;
+    }
 }
 
-public class P2pClient{
-    P2pClientWebsocket p2pClientWebsocket = null;
-    final Object lock;
-    final int max_read_bytes = 1024;
-    public P2pClient() {
-        this.lock = new Object();
-    }
+/**
+ * P2P客户端, 实例化后使用getP2PLocalPeerAddress获取打洞链接, 暂不支持对称型打洞
+ * 对于网络状态会发生变化的android设备, 建议注册netWorkStateReceiver避免网络变化后nat类型不准确, 导致对称型NAT时仍尝试打洞
+ */
+public class P2pClient {
+    private final int MAX_READ_BYTES = 1024;
+    public NetWorkStateReceiver netWorkStateReceiver = new NetWorkStateReceiver();
+    private P2pClientWebsocket p2pClientWebsocket = null;
+    private NatType natType;
+
     /**
      * Get IP address from first non-localhost interface
      * @param useIPv4   true=return ipv4, false=return ipv6
      * @return  address or empty string
      */
     @NotNull
-    public static String getIPAddress(boolean useIPv4) {
+    private String getIPAddress(boolean useIPv4) {
         try {
             List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());
             for (NetworkInterface intf : interfaces) {
@@ -114,110 +183,164 @@ public class P2pClient{
         return "";
     }
 
-    private HostTuple register_p2p_info(String p2p_server_ip, int p2p_server_port, String local_client_id)
-    {
-        int local_port = 0;
-        String response_str = null;
-        Socket socket;
-        String ip_local = getIPAddress(true);
-        int i;
-        char[] chs = new char[max_read_bytes];
-        int len = 0;
-        int read_len = 0;
-        for (i = 0; i < 2; i++) {
-            // TODO: 可以优化为不再每次确定, 重复两次让p2p server判断是否是对称型Symmetric NAT
-            try {
+    private InsideOutsideAddress getOutsideAddress(String p2PServerIp, int p2PServerPort, String localClientId, HostTuple insideAddress) {
+        String responseStr = null;
+        Socket socket = null;
+        HostTuple outsideAddress;
+        char[] readChars = new char[MAX_READ_BYTES];
+        int len;
+        int readLen;
+        SocketAddress socAddress;
+        JSONObject jsonObject;
 
-                if (local_port == 0) {
-                    socket = new Socket();
-                    SocketAddress socAddress = new InetSocketAddress(p2p_server_ip, p2p_server_port);
-                    socket.connect(socAddress, 5000);
-                    socket.setSoTimeout(5000);
-                    local_port = socket.getLocalPort();
-                } else {
-                    socket = new Socket();
-                    SocketAddress socAddress = new InetSocketAddress(p2p_server_ip, p2p_server_port);
-                    SocketAddress localSocAddress = new InetSocketAddress(ip_local, local_port);
-                    socket.bind(localSocAddress);
-                    socket.connect(socAddress, 5000);
-                    socket.setSoTimeout(5000);
-                }
-                OutputStreamWriter out = new OutputStreamWriter(socket.getOutputStream());
-                InputStreamReader in = new InputStreamReader(socket.getInputStream());
+        try {
+            socket = new Socket();
+            socAddress = new InetSocketAddress(p2PServerIp, p2PServerPort);
+            if (insideAddress == null) {
+                socket.connect(socAddress, 5000);
+                insideAddress = new HostTuple(getIPAddress(true), socket.getLocalPort());
+            } else {
+                SocketAddress localSocAddress = new InetSocketAddress(insideAddress.ip, insideAddress.port);
+                socket.bind(localSocAddress);
+                socket.connect(socAddress, 5000);
+            }
+            socket.setSoTimeout(5000);
 
-                String json_content = "{\"client_id\": " + "\"" +local_client_id + "\""
-                        + ", \"ip_inside\": " + "\"" + ip_local + "\""
-                        + ", \"port_inside\": " + local_port
-                        + "}";
+            OutputStreamWriter out = new OutputStreamWriter(socket.getOutputStream());
+            InputStreamReader in = new InputStreamReader(socket.getInputStream());
 
-                String send_string = "POST /p2pinfo/register HTTP/1.1\r\n"
-                        + "Host: " + p2p_server_ip + ":" + p2p_server_port+ "\r\n"
-                        + "Content-Type: application/json\r\n"
-                        + "Content-Length: " + json_content.length() + "\r\n"
-                        + "Connection: Close\r\n"
-                        + "\r\n"
-                        + json_content;
-                out.write(send_string);
-                out.flush();
+            String jsonContent = "{\"client_id\": " + "\"" +localClientId + "\""
+                    + ", \"ip_inside\": " + "\"" + insideAddress.ip + "\""
+                    + ", \"port_inside\": " + insideAddress.port
+                    + "}";
 
-                read_len = 0;
-                while (true)
-                {
-                    len = in.read(chs, read_len, max_read_bytes - read_len);
-                    if (len == -1 || read_len >= max_read_bytes)
-                    {
-                        System.out.println("read end, read bytes " + read_len);
-                        break;
-                    }
-                    read_len = read_len + len;
+            String sendString = "POST /p2pinfo/register HTTP/1.1\r\n"
+                    + "Host: " + p2PServerIp + ":" + p2PServerPort+ "\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Content-Length: " + jsonContent.length() + "\r\n"
+                    + "Connection: Close\r\n"
+                    + "\r\n"
+                    + jsonContent;
+            out.write(sendString);
+            out.flush();
+
+            readLen = 0;
+            while (true) {
+                len = in.read(readChars, readLen, MAX_READ_BYTES - readLen);
+                if (len == -1 || readLen >= MAX_READ_BYTES) {
+                    System.out.println("read end, read bytes " + readLen);
+                    break;
                 }
-                if (read_len != -1)
-                {
-                    response_str = new String(chs, 0, read_len);
-                    System.out.println(response_str);
+                readLen = readLen + len;
+            }
+            if (readLen > 0) {
+                responseStr = new String(readChars, 0, readLen);
+                System.out.println(responseStr);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        } finally {
+            if (socket != null) {
+                try {
+                    socket.close();
+                } catch (IOException ioException) {
+                    ioException.printStackTrace();
                 }
-                socket.close();
-                if (i != 1) {
-                    // 间隔100ms, 等待上次socket的端口完全释放
-                    // 避免java.net.BindException: bind failed: EADDRINUSE (Address already in use)
-                    Thread.sleep(100);
-                }
-            } catch (Exception e) {
-                e.printStackTrace();
             }
         }
 
-        if (response_str == null) {
+        try {
+            String httpContent = responseStr.substring(responseStr.indexOf("\r\n\r\n") + "\r\n\r\n".length());
+            jsonObject = new JSONObject(httpContent);
+            outsideAddress = new HostTuple(jsonObject.getString("ip_outside"), jsonObject.getInt("port_outside"));
+        } catch (JSONException e) {
+            e.printStackTrace();
             return null;
         }
 
-        String http_content = response_str.substring(response_str.indexOf("\r\n\r\n") + "\r\n\r\n".length());
+        return new InsideOutsideAddress(insideAddress, outsideAddress);
+    }
+
+    /**
+     * 确定当前设备所处网络环境的nat类型, 主要用于当检测到是对称型时, 不再耗费时间打洞
+     * @param p2PServerIp   在公网上的p2p服务器ip
+     * @param p2PServerPort   在公网上的p2p服务器端口
+     * @param localClientId   需要注册到p2p服务器上的本地client_id, 告知对端连接本地client_id
+     * @return  success return HostTuple or fail return null
+     */
+    private NatType getNatType(String p2PServerIp, int p2PServerPort, String localClientId) {
+        InsideOutsideAddress lastInsideOutsideAddress;
+        InsideOutsideAddress newInsideOutsideAddress;
+
+        // 在网络状态未发生变化时, nat类型一般不发生变化, 不再重新获取
+        if (!netWorkStateReceiver.isNetworkChanged) {
+            return natType;
+        }
+
+        // 先获取一个内部地址和外部地址的映射关系
+        lastInsideOutsideAddress = getOutsideAddress(p2PServerIp, p2PServerPort, localClientId, null);
+
+        // 间隔100ms, 等待上次socket的端口完全释放
+        // 避免java.net.BindException: bind failed: EADDRINUSE (Address already in use)
         try {
-            // TODO: 暂只考虑端口受限圆锥型NAT（Port-Restricted cone NAT)的服务端被连接的情况
-            JSONObject jsonObject = new JSONObject(http_content);
-            if (jsonObject.get("can_p2p_across_nat").equals(true)) {
-                return new HostTuple(ip_local, local_port);
-            }
-            else {
-                System.out.println("can_p2p_across_nat is not true, under Symmetric NAT");
-                return null;
-            }
-        } catch (JSONException e) {
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
             e.printStackTrace();
         }
 
-        return null;
+        // 再次使用上一次的内部地址, 获取与外部地址的映射关系
+        newInsideOutsideAddress = getOutsideAddress(p2PServerIp, p2PServerPort, localClientId, lastInsideOutsideAddress.insideAddress);
+
+        // 如果短时间连续2次相同的内部地址和外部地址的映射关系是相同的, 则说明不是对称型NAT
+        if (lastInsideOutsideAddress.equals(newInsideOutsideAddress))
+        {
+            natType = NatType.PORT_RESTRICTED_CONE_NAT;
+        } else {
+            natType = NatType.SYMMETRIC_NAT;
+        }
+
+        // 已在网络状态发生变化时重新获取nat类型, 重置isNetworkChanged
+        netWorkStateReceiver.isNetworkChanged = false;
+
+        return natType;
     }
 
-    private HostTuple get_p2p_subscribe_server(String p2p_server_ip, int p2p_server_port)
-    {
-        String response_str = null;
-        char[] chs = new char[max_read_bytes];
-        int len = 0;
-        int read_len = 0;
+    /**
+     * 向p2p公网服务器进行注册, 通知服务器更新local_client_id的外网地址, 在通知服务器打洞前调用
+     * @param p2PServerIp   在公网上的p2p服务器ip
+     * @param p2PServerPort   在公网上的p2p服务器端口
+     * @param localClientId   需要注册到p2p服务器上的本地client_id, 告知对端连接本地client_id
+     * @return  success return HostTuple or fail return null
+     */
+    private HostTuple registerP2PInfo(String p2PServerIp, int p2PServerPort, String localClientId) {
+        InsideOutsideAddress insideOutsideAddress;
+
+        insideOutsideAddress = getOutsideAddress(p2PServerIp, p2PServerPort, localClientId, null);
+        if (insideOutsideAddress == null) {
+            System.out.println("getOutsideAddress failed");
+            return null;
+        }
+
+        return insideOutsideAddress.insideAddress;
+    }
+
+    /**
+     * 获取p2p服务器对应的websocket服务器地址
+     * @param p2PServerIp   在公网上的p2p服务器ip
+     * @param p2PServerPort   在公网上的p2p服务器端口
+     * @return  success return websocketServerAddress or fail return null
+     */
+    private HostTuple getP2PSubscribeServer(String p2PServerIp, int p2PServerPort) {
+        String responseStr = null;
+        char[] readChars = new char[MAX_READ_BYTES];
+        int len;
+        int readLen = 0;
+        Socket socket = null;
+
         try {
-            Socket socket = new Socket();
-            SocketAddress socAddress = new InetSocketAddress(p2p_server_ip, p2p_server_port);
+            socket = new Socket();
+            SocketAddress socAddress = new InetSocketAddress(p2PServerIp, p2PServerPort);
             socket.connect(socAddress, 5000);
             socket.setSoTimeout(5000);
 
@@ -225,7 +348,7 @@ public class P2pClient{
             InputStreamReader in = new InputStreamReader(socket.getInputStream());
 
             String send_string = "GET /p2pinfo/subscribe/server HTTP/1.1\r\n"
-                    + "Host: " + p2p_server_ip + ":" + p2p_server_port+ "\r\n"
+                    + "Host: " + p2PServerIp + ":" + p2PServerPort+ "\r\n"
                     + "Content-Type: application/json\r\n"
                     + "Content-Length: 0\r\n"
                     + "Connection: Close\r\n"
@@ -233,29 +356,36 @@ public class P2pClient{
             out.write(send_string);
             out.flush();
 
-            while (true)
-            {
-                len = in.read(chs, read_len, max_read_bytes - read_len);
-                if (len == -1 || read_len >= max_read_bytes)
-                {
-                    System.out.println("read end, read bytes " + read_len);
+            while (true) {
+                len = in.read(readChars, readLen, MAX_READ_BYTES - readLen);
+                if (len == -1 || readLen >= MAX_READ_BYTES) {
+                    System.out.println("read end, read bytes " + readLen);
                     break;
                 }
-                read_len = read_len + len;
+                readLen = readLen + len;
             }
-            if (read_len != -1)
-            {
-                response_str = new String(chs, 0, read_len);
-                System.out.println(response_str);
-            }
-            socket.close();
 
-            assert response_str != null;
-            String http_content = response_str.substring(response_str.indexOf("\r\n\r\n") + "\r\n\r\n".length());
-            JSONObject jsonObject = new JSONObject(http_content);
-            return new HostTuple(jsonObject.getString("ip"), jsonObject.getInt("port"));
+            if (readLen > 0) {
+                responseStr = new String(readChars, 0, readLen);
+                System.out.println(responseStr);
+                String httpContent = responseStr.substring(responseStr.indexOf("\r\n\r\n") + "\r\n\r\n".length());
+                JSONObject jsonObject = new JSONObject(httpContent);
+                return new HostTuple(jsonObject.getString("ip"), jsonObject.getInt("port"));
+            } else {
+                System.out.println("read failed, read bytes " + readLen);
+            }
+
+            socket.close();
         } catch (Exception e) {
             e.printStackTrace();
+        } finally {
+            if (socket != null) {
+                try {
+                    socket.close();
+                } catch (IOException ioException) {
+                    ioException.printStackTrace();
+                }
+            }
         }
 
         return null;
@@ -263,22 +393,28 @@ public class P2pClient{
 
     /**
      * 获取能够通过p2p打洞连接远端的本地地址以及对端的地址, 暂不支持重入
-     * @param p2p_server_ip   在公网上的p2p服务器ip
-     * @param p2p_server_port   在公网上的p2p服务器端口
-     * @param local_client_id   需要注册到p2p服务器上的本地client_id, 告知对端连接本地client_id
-     * @param peer_client_id   需要通过p2p连接的对端的client_id
+     * @param p2PServerIp   在公网上的p2p服务器ip
+     * @param p2PServerPort   在公网上的p2p服务器端口
+     * @param localClientId   需要注册到p2p服务器上的本地client_id, 告知对端连接本地client_id
+     * @param peerClientId   需要通过p2p连接的对端的client_id
      * @return  success return LocalPeerAddress or fail return null
      */
-    public LocalPeerAddress getP2PLocalPeerAddress(String p2p_server_ip, int p2p_server_port, String local_client_id, String peer_client_id)
+    public synchronized LocalPeerAddress getP2PLocalPeerAddress(String p2PServerIp, int p2PServerPort, String localClientId, String peerClientId)
     {
         URI websocketServerUri;
         HostTuple p2pSubscribeServerHost;
         HostTuple p2pLocalHost;
         HostTuple p2pPeerHost;
 
+        if (getNatType(p2PServerIp, p2PServerPort, localClientId) == NatType.SYMMETRIC_NAT) {
+            System.out.println("not support SYMMETRIC_NAT");
+            return null;
+        }
+
+        // p2pClientWebsocket未初始化或者连接断开则重新建立连接
         if (p2pClientWebsocket == null || p2pClientWebsocket.isClosed()) {
             // 对端打洞完成后需要服务器实时通知到本地客户端, 通过订阅基于websocket的服务器实现实时通知
-            p2pSubscribeServerHost = get_p2p_subscribe_server(p2p_server_ip, p2p_server_port);
+            p2pSubscribeServerHost = getP2PSubscribeServer(p2PServerIp, p2PServerPort);
             if (p2pSubscribeServerHost == null) {
                 System.out.println("get_p2p_subscribe_server failed");
                 return null;
@@ -290,49 +426,26 @@ public class P2pClient{
                 e.printStackTrace();
                 return null;
             }
-            p2pClientWebsocket = new P2pClientWebsocket(websocketServerUri, lock);
+            p2pClientWebsocket = new P2pClientWebsocket(websocketServerUri);
             try {
-                p2pClientWebsocket.connectBlocking();
+                p2pClientWebsocket.register(localClientId);
             } catch (InterruptedException e) {
                 e.printStackTrace();
                 return null;
             }
         }
-        p2pClientWebsocket.send("{\"cmd\": \"register\", \"client_id\": \""+ local_client_id +"\", \"type\": \"client\"}");
 
-        p2pLocalHost = register_p2p_info(p2p_server_ip, p2p_server_port, local_client_id);
+        p2pLocalHost = registerP2PInfo(p2PServerIp, p2PServerPort, localClientId);
         if (p2pLocalHost == null) {
             System.out.println("register_p2p_info failed");
             return null;
         }
 
-        JSONObject jsonObject = new JSONObject();
-        try {
-            jsonObject.put("cmd", "notify_connect");
-            jsonObject.put("local_client_id", local_client_id);
-            jsonObject.put("peer_client_id", peer_client_id);
-        } catch (JSONException e) {
-            e.printStackTrace();
-            System.out.println("create jsonObject failed");
+        p2pPeerHost = p2pClientWebsocket.getPeerHost(localClientId, peerClientId);
+        if (p2pPeerHost == null) {
+            System.out.println("getPeerHost failed");
             return null;
         }
-        p2pClientWebsocket.send(jsonObject.toString());
-        // 等待响应, 当p2pClientWebsocket接收到响应时会进行lock.notify()
-        synchronized (lock) {
-            try {
-                lock.wait(5000);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-                return null;
-            }
-        }
-        if (p2pClientWebsocket.last_peer_host == null) {
-            System.out.println("can not get notify_connect response");
-            return null;
-        }
-        p2pPeerHost = new HostTuple(p2pClientWebsocket.last_peer_host.ip, p2pClientWebsocket.last_peer_host.port);
-        // 清空上次获取得到的host
-        p2pClientWebsocket.last_peer_host = null;
 
         System.out.println("local:" + p2pLocalHost+" ,peer:" + p2pPeerHost);
 

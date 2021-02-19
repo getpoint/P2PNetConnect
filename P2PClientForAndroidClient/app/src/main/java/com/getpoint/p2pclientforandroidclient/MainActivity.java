@@ -2,7 +2,9 @@ package com.getpoint.p2pclientforandroidclient;
 
 import android.Manifest;
 import android.content.Context;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.net.ConnectivityManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
@@ -54,18 +56,23 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         }
         button = findViewById(R.id.p2p_test_button);
         button.setOnClickListener(this);
+
         p2pClient = new P2pClient();
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ConnectivityManager.CONNECTIVITY_ACTION);
+        //注册网络状态变化监听类, 当网络状态发生变化时用于通知重新获取nat类型
+        registerReceiver(p2pClient.netWorkStateReceiver, filter);
     }
 
     private void p2pTest()
     {
-        EditText p2pServerText = null;
-        EditText p2pLocalIdText = null;
-        EditText p2pPeerIdText = null;
-        URI serverUri = null;
-        LocalPeerAddress localPeerAddress = null;
-        String localId = null;
-        String peerId = null;
+        EditText p2pServerText;
+        EditText p2pLocalIdText;
+        EditText p2pPeerIdText;
+        URI serverUri;
+        LocalPeerAddress localPeerAddress;
+        String localId;
+        String peerId;
 
         // 解析p2p服务器地址
         p2pServerText = (EditText) findViewById(R.id.p2p_server_text);
@@ -95,15 +102,15 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             return;
         } else {
             makeToastTextShow("getP2PLocalPeerAddress success in "+ used_time +" ms.\n" +
-                    "local_id: " + localId + ", localadress: " + localPeerAddress.LocalAddress + "\n" +
-                    "peer_id: " + peerId + ", peeradress: " + localPeerAddress.PeerAddress + "\n");
+                    "local_id: " + localId + ", localadress: " + localPeerAddress.localAddress + "\n" +
+                    "peer_id: " + peerId + ", peeradress: " + localPeerAddress.peerAddress + "\n");
         }
 
         // 测试p2p是否打洞成功
         Socket socket = new Socket();
         try {
-            SocketAddress socAddress = new InetSocketAddress(localPeerAddress.PeerAddress.ip, localPeerAddress.PeerAddress.port);
-            SocketAddress localSocAddress = new InetSocketAddress(localPeerAddress.LocalAddress.ip, localPeerAddress.LocalAddress.port);
+            SocketAddress socAddress = new InetSocketAddress(localPeerAddress.peerAddress.ip, localPeerAddress.peerAddress.port);
+            SocketAddress localSocAddress = new InetSocketAddress(localPeerAddress.localAddress.ip, localPeerAddress.localAddress.port);
             socket.bind(localSocAddress);
             socket.connect(socAddress, 5000);
             socket.setSoTimeout(5000);
@@ -130,23 +137,13 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         if (id == R.id.p2p_test_button)
         {
             // 由于android规范主线程不能有阻塞操作, 所以网络操作需要起线程
-            Thread thread = new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    p2pTest();
-                }
-            });
+            Thread thread = new Thread(this::p2pTest);
             thread.start();
         }
     }
 
     public void makeToastTextShow(final String showString) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                Toast.makeText(MainActivity.this, showString, Toast.LENGTH_SHORT).show();
-            }
-        });
+        runOnUiThread(() -> Toast.makeText(MainActivity.this, showString, Toast.LENGTH_SHORT).show());
     }
 
 }
